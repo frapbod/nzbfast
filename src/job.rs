@@ -336,6 +336,21 @@ fn is_obfuscated(name: &str) -> bool {
     stem.len() >= 10 && !stem.contains([' ', '.', '_', '-'])
 }
 
+/// Whether a file posted under an obfuscated yEnc name should keep its subject's name
+/// instead: packs with random yEnc names but real subjects otherwise all become
+/// `job.mkv`, `job.2.mkv`… The subject must name the same kind of file (an unquoted
+/// subject line is no file name).
+fn subject_names_better(yname: &str, guess: &str) -> bool {
+    let ext = |n: &str| {
+        n.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).filter(|e| (1..=4).contains(&e.len()) && e.bytes().all(|c| c.is_ascii_alphanumeric()))
+    };
+    let same_kind = match yname.rsplit_once('.') {
+        Some(_) => ext(yname).is_some_and(|e| ext(guess) == Some(e)),
+        None => ext(guess).is_some(),
+    };
+    is_obfuscated(yname) && !is_obfuscated(guess) && same_kind
+}
+
 /// Files Plex/*arr never need; damage there does not require a repair.
 fn non_essential(name: &str) -> bool {
     let l = name.to_ascii_lowercase();
@@ -927,7 +942,15 @@ impl Job {
         // Renamed outputs must not land on each other (or on a posted name).
         let mut used: std::collections::HashSet<String> = self.files.iter().map(|f| sanitize(&f.guess).to_string_lossy().to_ascii_lowercase()).collect();
         let make = |dir: &Path, name: &str, size: u64, outs: &mut Vec<Arc<OutFile>>, paths: &mut Vec<PathBuf>| -> Target {
-            let path = dir.join(sanitize(name));
+            // Every output gets its own path, whichever rule chose its name.
+            let mut path = dir.join(sanitize(name));
+            let file = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let (stem, ext) = file.rsplit_once('.').map(|(a, b)| (a.to_string(), format!(".{b}"))).unwrap_or((file.clone(), String::new()));
+            let mut k = 2;
+            while paths.iter().any(|q| q.as_os_str().eq_ignore_ascii_case(path.as_os_str())) {
+                path.set_file_name(format!("{stem}.{k}{ext}"));
+                k += 1;
+            }
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -945,16 +968,37 @@ impl Job {
         };
         // One name per file: some posters give every file the same yEnc name, which
         // would make them overwrite each other. Fall back to the subject's name, then
-        // to a numbered name.
-        let mut chosen: Vec<String> = self
-            .files
-            .iter()
-            .enumerate()
-            .map(|(i, f)| match &probes[i] {
-                Some(p) if !p.info.name.is_empty() => p.info.name.clone(),
-                _ => f.guess.clone(),
-            })
-            .collect();
+        // to a numbered name. An obfuscated yEnc name gives way to a unique, informative
+        // subject name.
+        let guesses: HashMap<String, usize> = self.files.iter().fold(HashMap::new(), |mut m, f| {
+            *m.entry(f.guess.to_lowercase()).or_default() += 1;
+            m
+        });
+        let unique_guess = |g: &str| guesses.get(&g.to_lowercase()).copied().unwrap_or(0) == 1;
+        let pick = |prefer_subject: bool| -> Vec<String> {
+            self.files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| match &probes[i] {
+                    Some(p) if !p.info.name.is_empty() && !(prefer_subject && unique_guess(&f.guess) && subject_names_better(&p.info.name, &f.guess)) => {
+                        p.info.name.clone()
+                    }
+                    _ => f.guess.clone(),
+                })
+                .collect()
+        };
+        // The subject preference is only kept when every file still ends on its own
+        // sanitized output path; any overlap (chained fallbacks, `./` aliases) reverts
+        // the whole job to the yEnc-first rule.
+        let mut chosen = pick(true);
+        {
+            let mut seen = std::collections::HashSet::new();
+            let distinct =
+                chosen.iter().enumerate().filter(|(i, _)| !self.files[*i].skip).all(|(_, n)| seen.insert(sanitize(n).to_string_lossy().to_ascii_lowercase()));
+            if !distinct {
+                chosen = pick(false);
+            }
+        }
         {
             let mut count: HashMap<String, usize> = HashMap::new();
             for (i, n) in chosen.iter().enumerate() {
@@ -962,16 +1006,12 @@ impl Job {
                     *count.entry(n.to_lowercase()).or_default() += 1;
                 }
             }
-            let guesses: HashMap<String, usize> = self.files.iter().fold(HashMap::new(), |mut m, f| {
-                *m.entry(f.guess.to_lowercase()).or_default() += 1;
-                m
-            });
             for (i, n) in chosen.iter_mut().enumerate() {
                 if self.files[i].skip || count.get(&n.to_lowercase()).copied().unwrap_or(0) < 2 {
                     continue;
                 }
                 let g = &self.files[i].guess;
-                *n = if guesses.get(&g.to_lowercase()).copied().unwrap_or(0) == 1 { g.clone() } else { format!("{n}.{i}") };
+                *n = if unique_guess(g) { g.clone() } else { format!("{n}.{i}") };
             }
         }
         for (i, f) in self.files.iter().enumerate() {
@@ -2436,5 +2476,288 @@ mod tests {
         assert_eq!(mkv_title(&d).as_deref(), Some(title));
         assert_eq!(episode_title(&d).as_deref(), Some(title));
         assert!(mkv_title(b"\x1a\x45\xdf\xa3garbage").is_none());
+    }
+
+    const JOB: &str = "Show.S01.1080p.WEB.h264-GRP";
+
+    /// First article of an MKV without a title, distinct per `k`.
+    fn mkv(k: u8) -> Vec<u8> {
+        let mut d = vec![0x1A, 0x45, 0xDF, 0xA3, 0x84, 0x42, 0x86, 0x81, 0x01];
+        d.resize(20000, k);
+        d
+    }
+
+    /// (subject name, yEnc name, first article as (data, offset); `None` = missing).
+    type TestFile<'a> = (&'a str, &'a str, Option<(Vec<u8>, u64)>);
+
+    fn plan_for(tag: &str, files: &[TestFile]) -> (Arc<Job>, Plan) {
+        let work = std::env::temp_dir().join(format!("nzbfast-job-test-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&work);
+        let n = files.len();
+        let nzb = Nzb {
+            name: JOB.into(),
+            files: files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| crate::nzb::NzbFile {
+                    subject: format!("{JOB} [{}/{n}] - \"{}\" yEnc (1/1)", i + 1, f.0),
+                    segs: vec![NzbSeg { number: 1, bytes: 1000, msgid: format!("<{tag}{i}@x>").into() }],
+                })
+                .collect(),
+            password: None,
+        };
+        let job = Job::new(0, nzb, work, None, Arc::new(|_, _| {}));
+        let probes: Vec<Option<Probe>> = files
+            .iter()
+            .map(|(_, y, d)| {
+                d.as_ref().map(|(d, off)| {
+                    let size = off + d.len() as u64;
+                    Probe {
+                        info: YInfo { name: y.to_string(), size, part: 1, total: 1, begin: off + 1, end: size, ..Default::default() },
+                        data: d.clone(),
+                        crc: 0,
+                    }
+                })
+            })
+            .collect();
+        let plan = job.build_plan(&probes);
+        (job, plan)
+    }
+
+    fn names(job: &Job, plan: &Plan) -> Vec<String> {
+        plan.paths.iter().map(|p| job.cur(p).file_name().unwrap().to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn subject_names() {
+        assert!(subject_names_better("a1b2c3d4e5f6a7b8.mkv", "Show.S01E01.1080p-GRP.mkv"));
+        assert!(subject_names_better("a1b2c3d4e5f6a7b8", "Show.S01E01.1080p-GRP.mkv"));
+        assert!(subject_names_better("a1b2c3d4e5f6a7b8.001", "Show.S01.7z.001"));
+        // Informative or matching yEnc names stay; so do unusable subjects.
+        assert!(!subject_names_better("Show.S01E01.mkv", "Other.S01E01.mkv"));
+        assert!(!subject_names_better("a1b2c3d4e5f6a7b8.mkv", "b1c2d3e4f5a6b7c8.mkv"));
+        assert!(!subject_names_better("a1b2c3d4e5f6a7b8.mkv", "Show.S01E01.nfo"));
+        assert!(!subject_names_better("a1b2c3d4e5f6a7b8", "Show.S01E01 yEnc (1/50)"));
+        assert!(!subject_names_better("a1b2c3d4e5f6a7b8.mkv", ""));
+    }
+
+    #[test]
+    fn plain_pack_keeps_subject_names() {
+        // Obfuscated yEnc names, real subjects, no MKV titles; NZB order is not episode order.
+        let eps = ["Show.S01E03.1080p.WEB.h264-GRP.mkv", "Show.S01E01.1080p.WEB.h264-GRP.mkv", "Show.S01E02.1080p.WEB.h264-GRP.mkv"];
+        let ynames = ["Xk3J9qLm2Pz8Rt4V.mkv", "Qw7Er2Ty5Ui8Op1A.mkv", "Zx4Cv7Bn0Ml3Kj6H.mkv"];
+        let files: Vec<_> = (0..3).map(|i| (eps[i], ynames[i], Some((mkv(i as u8), 0)))).collect();
+        let (job, plan) = plan_for("pack", &files);
+        assert_eq!(names(&job, &plan), eps);
+        assert_eq!(plan.main.len(), 3);
+        assert!(plan.main.iter().all(|m| !m.starts_with(JOB)));
+        let _ = fs::remove_dir_all(&job.work);
+    }
+
+    #[test]
+    fn valid_names_unchanged() {
+        let files = [
+            ("posted-as-this.mkv", "Show.S01E01.1080p.WEB.h264-GRP.mkv", Some((mkv(1), 0))),
+            ("Show.S01E02.Other.Name.mkv", "Show.S01E02.1080p.WEB.h264-GRP.mkv", Some((mkv(2), 0))),
+            ("Show.S01.nfo", "Show.S01.1080p.WEB.h264-GRP.nfo", Some((b"nfo".to_vec(), 0))),
+        ];
+        let (job, plan) = plan_for("valid", &files);
+        assert_eq!(names(&job, &plan), files.map(|f| f.1));
+        let _ = fs::remove_dir_all(&job.work);
+    }
+
+    #[test]
+    fn obfuscated_pack_falls_back_to_job_name() {
+        let ynames = ["Xk3J9qLm2Pz8Rt4V.mkv", "Qw7Er2Ty5Ui8Op1A.mkv", "Zx4Cv7Bn0Ml3Kj6H.mkv"];
+        let files: Vec<_> = (0..3).map(|i| (ynames[i], ynames[i], Some((mkv(i as u8), 0)))).collect();
+        let (job, plan) = plan_for("obf", &files);
+        assert_eq!(names(&job, &plan), [format!("{JOB}.mkv"), format!("{JOB}.2.mkv"), format!("{JOB}.3.mkv")]);
+        let _ = fs::remove_dir_all(&job.work);
+    }
+
+    #[test]
+    fn name_collisions() {
+        // A subject shared by two files names neither; a subject equal to the job-name
+        // fallback pushes that fallback to `.2`.
+        let fallback = format!("{JOB}.mkv");
+        let files = [
+            ("Show.S01E01.mkv", "Xk3J9qLm2Pz8Rt4V.mkv", Some((mkv(1), 0))),
+            ("Show.S01E01.mkv", "Qw7Er2Ty5Ui8Op1A.mkv", Some((mkv(2), 0))),
+            (fallback.as_str(), "Zx4Cv7Bn0Ml3Kj6H.mkv", Some((mkv(3), 0))),
+        ];
+        let (job, plan) = plan_for("dup", &files);
+        assert_eq!(names(&job, &plan), [format!("{JOB}.2.mkv"), format!("{JOB}.3.mkv"), format!("{JOB}.mkv")]);
+        let _ = fs::remove_dir_all(&job.work);
+    }
+
+    #[test]
+    fn missing_first_article_keeps_subject_names() {
+        let files = [
+            ("Show.S01E01.1080p.WEB.h264-GRP.mkv", "Xk3J9qLm2Pz8Rt4V.mkv", None),
+            ("Show.S01E02.1080p.WEB.h264-GRP.mkv", "Qw7Er2Ty5Ui8Op1A.mkv", Some((mkv(2), 716800))),
+            ("Show.S01E03.1080p.WEB.h264-GRP.mkv", "Zx4Cv7Bn0Ml3Kj6H.mkv", Some((mkv(3), 0))),
+        ];
+        let (job, plan) = plan_for("miss", &files);
+        assert_eq!(names(&job, &plan), files.map(|f| f.0));
+        let _ = fs::remove_dir_all(&job.work);
+    }
+
+    #[test]
+    fn reviewer_subject_selection_collision_chain() {
+        let files = [
+            ("Show.S01E01.mkv", "Xk3J9qLm2Pz8Rt4V.mkv", Some((mkv(1), 0))),
+            ("Show.S01E02.mkv", "Show.S01E01.mkv", Some((mkv(2), 0))),
+            ("Show.S01E03.mkv", "Show.S01E02.mkv", Some((mkv(3), 0))),
+        ];
+        let (job, plan) = plan_for("reviewer-chain", &files);
+        let got = names(&job, &plan);
+        eprintln!("reviewer collision chain outputs: {got:?}");
+        let unique: std::collections::HashSet<_> = plan.paths.iter().collect();
+        assert_eq!(unique.len(), files.len(), "different input files must not share output paths");
+    }
+
+    #[test]
+    fn reviewer_subject_selection_sanitized_aliases() {
+        let files =
+            [("Folder/./Show.S01E01.mkv", "Xk3J9qLm2Pz8Rt4V.mkv", Some((mkv(1), 0))), ("Folder/Show.S01E01.mkv", "Qw7Er2Ty5Ui8Op1A.mkv", Some((mkv(2), 0)))];
+        let (job, plan) = plan_for("reviewer-alias", &files);
+        eprintln!("reviewer sanitized alias outputs: {:?}", names(&job, &plan));
+        let unique: std::collections::HashSet<_> = plan.paths.iter().collect();
+        assert_eq!(unique.len(), files.len(), "unique raw names must not alias after sanitize");
+    }
+
+    fn par2_packet(kind: &[u8; 16], body: &[u8]) -> Vec<u8> {
+        use md5::{Digest, Md5};
+        let mut h = [7u8; 16].to_vec();
+        h.extend(kind);
+        h.extend(body);
+        let mut p = b"PAR2\0PKT".to_vec();
+        p.extend((32 + h.len() as u64).to_le_bytes());
+        p.extend(Md5::digest(&h));
+        p.extend(h);
+        p
+    }
+
+    fn par2_filedesc(id: u8, name: &str, data: &[u8]) -> Vec<u8> {
+        let mut b = [id; 16].to_vec();
+        b.extend([0u8; 16]);
+        b.extend(par2::md5_16k(data));
+        b.extend((data.len() as u64).to_le_bytes());
+        b.extend(name.as_bytes());
+        b.resize(b.len().next_multiple_of(4), 0);
+        par2_packet(b"PAR 2.0\0FileDesc", &b)
+    }
+
+    #[test]
+    fn obfuscated_pack_named_from_par2() {
+        // Nothing informative in the NZB: a clean download takes par2's names, by length
+        // and first 16 KiB; a file matching two descriptions keeps its name.
+        let data: Vec<Vec<u8>> = vec![mkv(1), mkv(2), mkv(3)];
+        let mut idx = par2_filedesc(1, "Show.S01E01.1080p.WEB.h264-GRP.mkv", &data[0]);
+        idx.extend(par2_filedesc(2, "Show.S01E02.1080p.WEB.h264-GRP.mkv", &data[1]));
+        idx.extend(par2_filedesc(3, "Show.S01E03.1080p.WEB.h264-GRP.mkv", &data[2]));
+        idx.extend(par2_filedesc(4, "Show.S01E03.Copy.1080p.WEB.h264-GRP.mkv", &data[2]));
+        let ynames = ["Xk3J9qLm2Pz8Rt4V.mkv", "Qw7Er2Ty5Ui8Op1A.mkv", "Zx4Cv7Bn0Ml3Kj6H.mkv", "Pa5Rt2Wq8Zx1Lk7M.par2"];
+        let mut files: Vec<_> = (0..3).map(|i| (ynames[i], ynames[i], Some((data[i].clone(), 0)))).collect();
+        files.push((ynames[3], ynames[3], Some((idx.clone(), 0))));
+        let (job, plan) = plan_for("par2", &files);
+        assert_eq!(plan.par2_outs, [3]);
+        for (i, d) in data.iter().chain([&idx]).enumerate() {
+            fs::write(&plan.paths[i], d).unwrap();
+        }
+        assert_eq!(job.rename_plain_by_par2(&plan), 2);
+        let got = names(&job, &plan);
+        assert_eq!(got[..3], ["Show.S01E01.1080p.WEB.h264-GRP.mkv", "Show.S01E02.1080p.WEB.h264-GRP.mkv", format!("{JOB}.3.mkv").as_str()]);
+        let _ = fs::remove_dir_all(&job.work);
+    }
+
+    /// MKV first article whose Segment title is `t`.
+    fn titled(t: &str) -> Vec<u8> {
+        let mut title = vec![0x7B, 0xA9, 0x80 | t.len() as u8];
+        title.extend(t.as_bytes());
+        let mut d = vec![0x1A, 0x45, 0xDF, 0xA3, 0x80, 0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        d.extend([0x15, 0x49, 0xA9, 0x66, 0x80 | title.len() as u8]);
+        d.extend(title);
+        d.resize(20000, 7);
+        d
+    }
+
+    fn distinct_paths(plan: &Plan) -> bool {
+        let u: std::collections::HashSet<_> = plan.paths.iter().map(|p| p.to_string_lossy().to_ascii_lowercase()).collect();
+        u.len() == plan.paths.len()
+    }
+
+    #[test]
+    fn reviewer_deobf_rename_reserves_kept_names() {
+        // File 1 keeps its posted name, which equals the job-name fallback; file 3's
+        // obfuscated name is deobfuscated to that same fallback.
+        let fallback = format!("{JOB}.mkv");
+        let files = [
+            ("Show.S01E01", fallback.as_str(), Some((mkv(1), 0))),
+            ("Folder/Show.S01E01.mkv", "Xk3J9qLm2Pz8Rt4V.mkv", Some((mkv(2), 0))),
+            ("Show.S01.nfo", "Xk3J9qLm2Pz8Rt4V.mkv", Some((mkv(3), 0))),
+        ];
+        let (job, plan) = plan_for("reviewer-deobf", &files);
+        eprintln!("reviewer deobf outputs: {:?}", names(&job, &plan));
+        assert!(distinct_paths(&plan), "different input files must not share output paths");
+        let _ = fs::remove_dir_all(&job.work);
+    }
+
+    fn xs(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    #[test]
+    fn reviewer_random_posts_never_share_output_paths() {
+        // Random small posts mixing episode, aliased, obfuscated, extensionless, job-name
+        // and numbered names, MKV titles, text, missing and mid-file first articles.
+        let (j1, j2) = (format!("{JOB}.mkv"), format!("{JOB}.2.mkv"));
+        let subj = [
+            "Show.S01E01.mkv",
+            "Show.S01E02.mkv",
+            "Show.S01E03.mkv",
+            "show.s01e01.mkv",
+            "Folder/./Show.S01E01.mkv",
+            "Folder/Show.S01E01.mkv",
+            "Folder\\Show.S01E01.mkv",
+            "/Show.S01E02.mkv",
+            "Xk3J9qLm2Pz8Rt4V.mkv",
+            "Qw7Er2Ty5Ui8Op1A.mkv",
+            "a1b2c3d4e5f6a7b8",
+            "Show.S01E01",
+            "Show.S01.nfo",
+            "Show.S01E01.mkv.1",
+            "Show.S01E02.mkv.2",
+            &j1,
+            &j2,
+            "Show.S01.E01",
+            "",
+        ];
+        let ynames: Vec<&str> = subj.iter().copied().chain(["Zx4Cv7Bn0Ml3Kj6H.mkv", "z9y8x7w6v5u4t3s2"]).collect();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for case in 0..3000 {
+            let n = 2 + (xs(&mut seed) % 3) as usize;
+            let mut owned = vec![];
+            for k in 0..n {
+                let s = subj[(xs(&mut seed) as usize) % subj.len()];
+                let y = ynames[(xs(&mut seed) as usize) % ynames.len()];
+                let d = match xs(&mut seed) % 10 {
+                    0 => None,
+                    1 => Some((mkv(k as u8), 716800)),
+                    2 => Some((b"plain text nfo".to_vec(), 0)),
+                    3 => Some((titled(["Show.S01E01.1080p", "Show.S01E02.1080p", "Show.S01E03"][(xs(&mut seed) % 3) as usize]), 0)),
+                    _ => Some((mkv(k as u8), 0)),
+                };
+                owned.push((s, y, d));
+            }
+            let (job, plan) = plan_for(&format!("fz{case}"), &owned);
+            let ok = distinct_paths(&plan);
+            let got = names(&job, &plan);
+            let _ = fs::remove_dir_all(&job.work);
+            assert!(ok, "case {case}: {:?} -> {got:?}", owned.iter().map(|f| (f.0, f.1, f.2.as_ref().map(|d| d.1))).collect::<Vec<_>>());
+        }
     }
 }
