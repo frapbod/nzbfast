@@ -967,15 +967,30 @@ impl Job {
             m
         });
         let unique_guess = |g: &str| guesses.get(&g.to_lowercase()).copied().unwrap_or(0) == 1;
-        let mut chosen: Vec<String> = self
-            .files
-            .iter()
-            .enumerate()
-            .map(|(i, f)| match &probes[i] {
-                Some(p) if !p.info.name.is_empty() && !(unique_guess(&f.guess) && subject_names_better(&p.info.name, &f.guess)) => p.info.name.clone(),
-                _ => f.guess.clone(),
-            })
-            .collect();
+        let pick = |prefer_subject: bool| -> Vec<String> {
+            self.files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| match &probes[i] {
+                    Some(p) if !p.info.name.is_empty() && !(prefer_subject && unique_guess(&f.guess) && subject_names_better(&p.info.name, &f.guess)) => {
+                        p.info.name.clone()
+                    }
+                    _ => f.guess.clone(),
+                })
+                .collect()
+        };
+        // The subject preference is only kept when every file still ends on its own
+        // sanitized output path; any overlap (chained fallbacks, `./` aliases) reverts
+        // the whole job to the yEnc-first rule.
+        let mut chosen = pick(true);
+        {
+            let mut seen = std::collections::HashSet::new();
+            let distinct =
+                chosen.iter().enumerate().filter(|(i, _)| !self.files[*i].skip).all(|(_, n)| seen.insert(sanitize(n).to_string_lossy().to_ascii_lowercase()));
+            if !distinct {
+                chosen = pick(false);
+            }
+        }
         {
             let mut count: HashMap<String, usize> = HashMap::new();
             for (i, n) in chosen.iter().enumerate() {
@@ -2577,6 +2592,30 @@ mod tests {
         let (job, plan) = plan_for("miss", &files);
         assert_eq!(names(&job, &plan), files.map(|f| f.0));
         let _ = fs::remove_dir_all(&job.work);
+    }
+
+    #[test]
+    fn reviewer_subject_selection_collision_chain() {
+        let files = [
+            ("Show.S01E01.mkv", "Xk3J9qLm2Pz8Rt4V.mkv", Some((mkv(1), 0))),
+            ("Show.S01E02.mkv", "Show.S01E01.mkv", Some((mkv(2), 0))),
+            ("Show.S01E03.mkv", "Show.S01E02.mkv", Some((mkv(3), 0))),
+        ];
+        let (job, plan) = plan_for("reviewer-chain", &files);
+        let got = names(&job, &plan);
+        eprintln!("reviewer collision chain outputs: {got:?}");
+        let unique: std::collections::HashSet<_> = plan.paths.iter().collect();
+        assert_eq!(unique.len(), files.len(), "different input files must not share output paths");
+    }
+
+    #[test]
+    fn reviewer_subject_selection_sanitized_aliases() {
+        let files =
+            [("Folder/./Show.S01E01.mkv", "Xk3J9qLm2Pz8Rt4V.mkv", Some((mkv(1), 0))), ("Folder/Show.S01E01.mkv", "Qw7Er2Ty5Ui8Op1A.mkv", Some((mkv(2), 0)))];
+        let (job, plan) = plan_for("reviewer-alias", &files);
+        eprintln!("reviewer sanitized alias outputs: {:?}", names(&job, &plan));
+        let unique: std::collections::HashSet<_> = plan.paths.iter().collect();
+        assert_eq!(unique.len(), files.len(), "unique raw names must not alias after sanitize");
     }
 
     fn par2_packet(kind: &[u8; 16], body: &[u8]) -> Vec<u8> {
