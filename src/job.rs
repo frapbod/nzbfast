@@ -942,7 +942,15 @@ impl Job {
         // Renamed outputs must not land on each other (or on a posted name).
         let mut used: std::collections::HashSet<String> = self.files.iter().map(|f| sanitize(&f.guess).to_string_lossy().to_ascii_lowercase()).collect();
         let make = |dir: &Path, name: &str, size: u64, outs: &mut Vec<Arc<OutFile>>, paths: &mut Vec<PathBuf>| -> Target {
-            let path = dir.join(sanitize(name));
+            // Every output gets its own path, whichever rule chose its name.
+            let mut path = dir.join(sanitize(name));
+            let file = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let (stem, ext) = file.rsplit_once('.').map(|(a, b)| (a.to_string(), format!(".{b}"))).unwrap_or((file.clone(), String::new()));
+            let mut k = 2;
+            while paths.iter().any(|q| q.as_os_str().eq_ignore_ascii_case(path.as_os_str())) {
+                path.set_file_name(format!("{stem}.{k}{ext}"));
+                k += 1;
+            }
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -2661,5 +2669,95 @@ mod tests {
         let got = names(&job, &plan);
         assert_eq!(got[..3], ["Show.S01E01.1080p.WEB.h264-GRP.mkv", "Show.S01E02.1080p.WEB.h264-GRP.mkv", format!("{JOB}.3.mkv").as_str()]);
         let _ = fs::remove_dir_all(&job.work);
+    }
+
+    /// MKV first article whose Segment title is `t`.
+    fn titled(t: &str) -> Vec<u8> {
+        let mut title = vec![0x7B, 0xA9, 0x80 | t.len() as u8];
+        title.extend(t.as_bytes());
+        let mut d = vec![0x1A, 0x45, 0xDF, 0xA3, 0x80, 0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        d.extend([0x15, 0x49, 0xA9, 0x66, 0x80 | title.len() as u8]);
+        d.extend(title);
+        d.resize(20000, 7);
+        d
+    }
+
+    fn distinct_paths(plan: &Plan) -> bool {
+        let u: std::collections::HashSet<_> = plan.paths.iter().map(|p| p.to_string_lossy().to_ascii_lowercase()).collect();
+        u.len() == plan.paths.len()
+    }
+
+    #[test]
+    fn reviewer_deobf_rename_reserves_kept_names() {
+        // File 1 keeps its posted name, which equals the job-name fallback; file 3's
+        // obfuscated name is deobfuscated to that same fallback.
+        let fallback = format!("{JOB}.mkv");
+        let files = [
+            ("Show.S01E01", fallback.as_str(), Some((mkv(1), 0))),
+            ("Folder/Show.S01E01.mkv", "Xk3J9qLm2Pz8Rt4V.mkv", Some((mkv(2), 0))),
+            ("Show.S01.nfo", "Xk3J9qLm2Pz8Rt4V.mkv", Some((mkv(3), 0))),
+        ];
+        let (job, plan) = plan_for("reviewer-deobf", &files);
+        eprintln!("reviewer deobf outputs: {:?}", names(&job, &plan));
+        assert!(distinct_paths(&plan), "different input files must not share output paths");
+        let _ = fs::remove_dir_all(&job.work);
+    }
+
+    fn xs(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    #[test]
+    fn reviewer_random_posts_never_share_output_paths() {
+        // Random small posts mixing episode, aliased, obfuscated, extensionless, job-name
+        // and numbered names, MKV titles, text, missing and mid-file first articles.
+        let (j1, j2) = (format!("{JOB}.mkv"), format!("{JOB}.2.mkv"));
+        let subj = [
+            "Show.S01E01.mkv",
+            "Show.S01E02.mkv",
+            "Show.S01E03.mkv",
+            "show.s01e01.mkv",
+            "Folder/./Show.S01E01.mkv",
+            "Folder/Show.S01E01.mkv",
+            "Folder\\Show.S01E01.mkv",
+            "/Show.S01E02.mkv",
+            "Xk3J9qLm2Pz8Rt4V.mkv",
+            "Qw7Er2Ty5Ui8Op1A.mkv",
+            "a1b2c3d4e5f6a7b8",
+            "Show.S01E01",
+            "Show.S01.nfo",
+            "Show.S01E01.mkv.1",
+            "Show.S01E02.mkv.2",
+            &j1,
+            &j2,
+            "Show.S01.E01",
+            "",
+        ];
+        let ynames: Vec<&str> = subj.iter().copied().chain(["Zx4Cv7Bn0Ml3Kj6H.mkv", "z9y8x7w6v5u4t3s2"]).collect();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for case in 0..3000 {
+            let n = 2 + (xs(&mut seed) % 3) as usize;
+            let mut owned = vec![];
+            for k in 0..n {
+                let s = subj[(xs(&mut seed) as usize) % subj.len()];
+                let y = ynames[(xs(&mut seed) as usize) % ynames.len()];
+                let d = match xs(&mut seed) % 10 {
+                    0 => None,
+                    1 => Some((mkv(k as u8), 716800)),
+                    2 => Some((b"plain text nfo".to_vec(), 0)),
+                    3 => Some((titled(["Show.S01E01.1080p", "Show.S01E02.1080p", "Show.S01E03"][(xs(&mut seed) % 3) as usize]), 0)),
+                    _ => Some((mkv(k as u8), 0)),
+                };
+                owned.push((s, y, d));
+            }
+            let (job, plan) = plan_for(&format!("fz{case}"), &owned);
+            let ok = distinct_paths(&plan);
+            let got = names(&job, &plan);
+            let _ = fs::remove_dir_all(&job.work);
+            assert!(ok, "case {case}: {:?} -> {got:?}", owned.iter().map(|f| (f.0, f.1, f.2.as_ref().map(|d| d.1))).collect::<Vec<_>>());
+        }
     }
 }
