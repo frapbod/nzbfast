@@ -194,7 +194,7 @@ fn get(args: &[String]) {
         let tls = conn::tls_config(s.insecure);
         for _ in 0..s.conns {
             let ctx = ConnCtx { idx: i, cfg: s.clone(), depth: d, tls: tls.clone(), q: q.clone(), st: stats[i].clone() };
-            std::thread::Builder::new().stack_size(256 << 10).spawn(move || conn::run(ctx)).unwrap();
+            std::thread::Builder::new().stack_size(conn::CONN_STACK).spawn(move || conn::run(ctx)).unwrap();
         }
         total_slots += s.conns * d;
     }
