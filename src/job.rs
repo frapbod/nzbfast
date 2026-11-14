@@ -212,6 +212,14 @@ pub fn is_par2_volume(name: &str) -> bool {
     is_par2_name(name) && name.to_ascii_lowercase().contains(".vol")
 }
 
+/// The par2 set a file name belongs to: `x.par2`, `x.vol07+08.par2` and `x.vol-01.par2`
+/// all belong to `x`.
+fn par2_set_name(name: &str) -> Option<String> {
+    let l = name.to_ascii_lowercase();
+    let stem = l.strip_suffix(".par2")?;
+    Some(stem.rfind(".vol").map_or(stem, |i| &stem[..i]).to_string())
+}
+
 fn sanitize(rel: &str) -> PathBuf {
     let mut p = PathBuf::new();
     for c in rel.split(['/', '\\']) {
@@ -468,7 +476,7 @@ impl IoOwner for Job {
 
 impl Job {
     pub fn new(id: usize, nzb: Nzb, work: PathBuf, done_dir: Option<PathBuf>, finished: OnFinish) -> Arc<Job> {
-        let files: Vec<JFile> = nzb
+        let mut files: Vec<JFile> = nzb
             .files
             .into_iter()
             .map(|f| {
@@ -478,6 +486,24 @@ impl Job {
                 JFile { guess, segs: f.segs, skip, par2_blocks }
             })
             .collect();
+        // Every par2 set needs one file fetched up front: it names and verifies the
+        // outputs. Some posters give the index a volume-like name too (`x.vol-01.par2`),
+        // so a set made only of "volumes" fetches its smallest file; every par2 file
+        // carries the file descriptions.
+        let mut index: HashMap<String, Option<(u64, usize)>> = HashMap::new();
+        for (i, f) in files.iter().enumerate() {
+            let Some(set) = par2_set_name(&f.guess) else { continue };
+            let size: u64 = f.segs.iter().map(|s| s.bytes as u64).sum();
+            let e = index.entry(set).or_insert(Some((u64::MAX, i)));
+            match e {
+                Some(m) if f.skip => *m = (*m).min((size, i)),
+                _ => *e = None,
+            }
+        }
+        for (_, i) in index.into_values().flatten() {
+            files[i].skip = false;
+            files[i].par2_blocks = None;
+        }
         let bytes_total = files.iter().filter(|f| !f.skip).flat_map(|f| f.segs.iter()).map(|s| s.bytes as u64).sum();
         let probes_left = files.iter().filter(|f| !f.skip).count();
         // Until the probes reveal which files really are par2, assume named ones are.
@@ -1675,6 +1701,17 @@ impl Job {
         out
     }
 
+    /// The videos in the job folder, as `name (size GB)`.
+    fn video_list(&self) -> Vec<String> {
+        let files = self.output_files().into_iter().filter(|p| is_video(&p.to_string_lossy()));
+        files
+            .map(|p| {
+                let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                format!("{} ({:.2} GB)", p.strip_prefix(&self.work).unwrap_or(&p).display(), size as f64 / 1e9)
+            })
+            .collect()
+    }
+
     /// Fixes what the unpackers leave behind that Radarr/Sonarr reject as "no video
     /// files": raw split files (`x.mkv.001`…), files whose names lost their extension,
     /// and archives inside the archive (unpacked only while there is no video yet, so
@@ -2398,6 +2435,7 @@ impl Job {
         }
         parts.extend(raw);
         parts.extend(z);
+        let main_at = parts.len();
         parts.extend(plan.main.iter().cloned());
         parts.extend(notes);
         let write_errors: usize = plan.outs.iter().map(|o| o.write_errors.load(Relaxed)).sum();
@@ -2412,6 +2450,10 @@ impl Job {
             }
             let _ = fs::remove_dir_all(self.work.join(".aux"));
             parts.extend(self.tidy_output());
+            // Report the videos under their final names, after the renames above.
+            if !plan.main.is_empty() {
+                parts.splice(main_at..main_at + plan.main.len(), self.video_list());
+            }
             if let Some(done) = &self.done_dir {
                 if let Some(parent) = done.parent() {
                     let _ = fs::create_dir_all(parent);
@@ -2668,6 +2710,60 @@ mod tests {
         assert_eq!(job.rename_plain_by_par2(&plan), 2);
         let got = names(&job, &plan);
         assert_eq!(got[..3], ["Show.S01E01.1080p.WEB.h264-GRP.mkv", "Show.S01E02.1080p.WEB.h264-GRP.mkv", format!("{JOB}.3.mkv").as_str()]);
+        let _ = fs::remove_dir_all(&job.work);
+    }
+
+    #[test]
+    fn par2_index_with_volume_name_is_fetched() {
+        // Posts that name every par2 file `x.vol-NN.par2` (Wednesday S01 playWEB, Duke of
+        // Death S02E11): the small index looks like a volume. Each set fetches its smallest
+        // file; sets with a real index or volumes of their own keep the old rule.
+        let f = |name: &str, segs: u32| crate::nzb::NzbFile {
+            subject: format!("\"{name}\" yEnc"),
+            segs: (1..=segs).map(|n| NzbSeg { number: n, bytes: 1000, msgid: format!("<{name}{n}@x>").into() }).collect(),
+        };
+        let files = vec![
+            f("Show.S01.vol-01.par2", 3),
+            f("Show.S01E01.mkv", 9),
+            f("Show.S01.vol-02.par2", 1),
+            f("Show.S01.vol-03.par2", 2),
+            f("Other.par2", 1),
+            f("Other.vol00+01.par2", 1),
+            f("Lone.vol1+2.par2", 4),
+            f("Lone.vol0+1.par2", 2),
+        ];
+        let work = std::env::temp_dir().join(format!("nzbfast-job-test-{}-volidx", std::process::id()));
+        let job = Job::new(0, Nzb { name: JOB.into(), files, password: None }, work, None, Arc::new(|_, _| {}));
+        let skip: Vec<bool> = job.files.iter().map(|f| f.skip).collect();
+        assert_eq!(skip, [true, false, false, true, false, true, true, false]);
+        assert_eq!(job.files[7].par2_blocks, None);
+        assert_eq!(job.files[6].par2_blocks, Some(2));
+    }
+
+    #[test]
+    fn obfuscated_pack_with_volume_named_index_named_from_par2() {
+        // Fully obfuscated 3-file pack whose par2 index is posted as `x.vol-01.par2`: the
+        // index is fetched, the files take par2's names, and the report shows those names.
+        let data: Vec<Vec<u8>> = vec![mkv(1), mkv(2), mkv(3)];
+        let mut idx = par2_filedesc(1, "Show.S01E01.1080p.WEB.h264-GRP.mkv", &data[0]);
+        idx.extend(par2_filedesc(2, "Show.S01E02.1080p.WEB.h264-GRP.mkv", &data[1]));
+        idx.extend(par2_filedesc(3, "Show.S01E03.1080p.WEB.h264-GRP.mkv", &data[2]));
+        let ynames = ["Xk3J9qLm2Pz8Rt4V.mkv", "Qw7Er2Ty5Ui8Op1A.mkv", "Zx4Cv7Bn0Ml3Kj6H.mkv", "Pa5Rt2Wq8Zx1Lk7M.vol-01.par2", "Pa5Rt2Wq8Zx1Lk7M.vol-02.par2"];
+        let mut files: Vec<_> = (0..3).map(|i| (ynames[i], ynames[i], Some((data[i].clone(), 0)))).collect();
+        files.push((ynames[3], ynames[3], Some((idx.clone(), 0))));
+        files.push((ynames[4], ynames[4], Some((idx.clone(), 0))));
+        let (job, plan) = plan_for("volidx", &files);
+        assert!(matches!(plan.targets[4], Target::Skip));
+        assert_eq!(plan.par2_outs, [3]);
+        for (i, d) in data.iter().chain([&idx]).enumerate() {
+            fs::write(&plan.paths[i], d).unwrap();
+        }
+        assert_eq!(plan.main.iter().filter(|m| m.contains(".2.mkv")).count(), 1, "planned names are job-based: {:?}", plan.main);
+        assert_eq!(job.rename_plain_by_par2(&plan), 3);
+        let shows = (1..=3).map(|k| format!("Show.S01E0{k}.1080p.WEB.h264-GRP.mkv")).collect::<Vec<_>>();
+        assert_eq!(names(&job, &plan)[..3], shows[..]);
+        let listed: Vec<String> = job.video_list().iter().map(|v| v.split(" (").next().unwrap().to_string()).collect();
+        assert_eq!(listed, shows);
         let _ = fs::remove_dir_all(&job.work);
     }
 
