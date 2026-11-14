@@ -339,7 +339,7 @@ impl Engine {
             );
             for _ in 0..s.conns {
                 let ctx = ConnCtx { idx: i, cfg: s.clone(), depth, tls: tls.clone(), q: q.clone(), st: stats[i].clone() };
-                std::thread::Builder::new().stack_size(256 << 10).spawn(move || conn::run(ctx)).map_err(|e| e.to_string())?;
+                std::thread::Builder::new().stack_size(conn::CONN_STACK).spawn(move || conn::run(ctx)).map_err(|e| e.to_string())?;
             }
             total += s.conns * depth;
         }

@@ -68,6 +68,10 @@ impl Limiter {
     }
 }
 
+/// Stack size of each connection thread. Kept small because there is one thread per
+/// connection; the TLS handshake (`tls_handshake_fits_conn_stack`) must fit in it.
+pub const CONN_STACK: usize = 256 << 10;
+
 pub trait Stream: Read + Write + Send {}
 impl<T: Read + Write + Send> Stream for T {}
 
@@ -551,5 +555,62 @@ fn session(ctx: &ConnCtx, inflight: &mut VecDeque<Work>, worked: &mut bool) -> i
             }
             _ => return Err(err(format!("unexpected: {}", &status[..status.len().min(80)]))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// A release build whose C crypto code is compiled without optimization overflows the
+    /// connection thread's stack in the TLS handshake (zig cc does that unless CFLAGS
+    /// sets -O): every download then aborts the process. Shake hands the way `run` does,
+    /// on a `CONN_STACK` thread, with RSA-4096 keys (real providers use 2048-4096).
+    #[test]
+    fn tls_handshake_fits_conn_stack() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let leaf = rustls::pki_types::CertificateDer::from(&include_bytes!("testdata/tls-leaf.der")[..]);
+        let key = rustls::pki_types::PrivateKeyDer::try_from(&include_bytes!("testdata/tls-leaf.key.der")[..]).unwrap().clone_key();
+        let server = Arc::new(rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![leaf], key).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut s = rustls::StreamOwned::new(rustls::ServerConnection::new(server).unwrap(), tcp);
+            s.write_all(b"200 test server\r\n").unwrap();
+            s.flush().unwrap();
+            let _ = s.read(&mut [0u8; 1]);
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(rustls::pki_types::CertificateDer::from(&include_bytes!("testdata/tls-ca.der")[..])).unwrap();
+        let tls = Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let cfg = ServerCfg {
+            name: "test".into(),
+            host: "localhost".into(),
+            port: addr.port(),
+            tls: true,
+            insecure: false,
+            user: String::new(),
+            pass: String::new(),
+            conns: 1,
+            priority: 0,
+            depth: 1,
+            connect: Some(addr.to_string()),
+        };
+        let greeting = std::thread::Builder::new()
+            .stack_size(CONN_STACK)
+            .spawn(move || {
+                let mut rd = Rd { s: connect(&cfg, &tls).unwrap(), buf: vec![0; 4096], start: 0, end: 0, rx: None };
+                let g = rd.line();
+                drop(rd);
+                g
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(greeting, "200 test server");
+        srv.join().unwrap();
     }
 }
